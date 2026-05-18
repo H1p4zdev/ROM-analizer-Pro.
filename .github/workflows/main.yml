@@ -1,4 +1,4 @@
-name: ROM Analyzer PRO 2026 Stable
+name: ROM Analyzer PRO (Mirror Binary)
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
         description: "ROM URL"
         required: true
       extra_file:
-        description: "Optional file (build.prop, etc.)"
+        description: "Optional file (e.g. boot.prop, *.xml)"
         required: false
 
 jobs:
@@ -19,7 +19,7 @@ jobs:
     steps:
 
       # =========================
-      # 1. INSTALL DEPENDENCIES (2026 FIXED)
+      # 1. INSTALL DEPENDENCIES (2026 SAFE)
       # =========================
       - name: Install system tools
         run: |
@@ -29,25 +29,26 @@ jobs:
             p7zip-full \
             erofs-utils \
             android-sdk-libsparse-utils \
-            git cmake build-essential liblz4-dev libzstd-dev wget
+            wget
 
       # =========================
-      # 2. BUILD LPUNPACK FROM AOSP (IMPORTANT FIX)
+      # 2. GET LPUNPACK (MIRROR BINARY)
       # =========================
-      - name: Build lpunpack (AOSP safe build)
+      - name: Download lpunpack binary
         run: |
-          git clone https://android.googlesource.com/platform/system/extras
-          cd extras
+          git clone https://github.com/whyshhnuv/lpunpack-lpmake-mirror.git tools
 
-          mkdir build && cd build
-          cmake ../liblp/tools
-          make -j$(nproc)
+          chmod +x tools/binary/lpunpack
+          chmod +x tools/binary/lpmake
 
-          cp lpunpack $GITHUB_WORKSPACE/lpunpack
-          chmod +x $GITHUB_WORKSPACE/lpunpack
+          cp tools/binary/lpunpack $GITHUB_WORKSPACE/lpunpack
+          cp tools/binary/lpmake $GITHUB_WORKSPACE/lpmake
+
+          echo "Checking binary:"
+          file lpunpack || true
 
       # =========================
-      # 3. DOWNLOAD ROM (WITH RETRY)
+      # 3. DOWNLOAD ROM
       # =========================
       - name: Download ROM
         run: |
@@ -57,25 +58,21 @@ jobs:
           done
 
       # =========================
-      # 4. EXTRACT ROM (SAFE FALLBACK)
+      # 4. EXTRACT ROM
       # =========================
       - name: Extract ROM
         run: |
           mkdir rom
-
-          unzip -q rom.zip -d rom || \
-          7z x rom.zip -orom -y || \
-          (echo "ROM extraction failed" && exit 1)
+          unzip -q rom.zip -d rom || 7z x rom.zip -orom -y
 
       # =========================
-      # 5. FIND + NORMALIZE super.img
+      # 5. FIND + MERGE super.img
       # =========================
       - name: Prepare super.img
         run: |
           mkdir work
 
           find rom -iname "super.img*" -exec cp {} work/ \; || true
-
           cd work
 
           # merge split parts
@@ -93,7 +90,7 @@ jobs:
           fi
 
       # =========================
-      # 6. CONVERT SPARSE IMAGE
+      # 6. HANDLE SPARSE IMAGE
       # =========================
       - name: Normalize image
         run: |
@@ -104,20 +101,20 @@ jobs:
           simg2img super.img super.raw.img || cp super.img super.raw.img
 
       # =========================
-      # 7. UNPACK SUPER PARTITIONS
+      # 7. UNPACK SUPER USING YOUR BINARY
       # =========================
-      - name: Unpack super image
+      - name: Unpack super.img
         run: |
           mkdir super_out
 
           ./lpunpack work/super.raw.img super_out || {
             echo "lpunpack failed, retrying..."
-            sleep 3
+            sleep 2
             ./lpunpack work/super.raw.img super_out || exit 1
           }
 
       # =========================
-      # 8. EXTRACT PARTITIONS (PARALLEL SAFE MODE)
+      # 8. EXTRACT PARTITIONS (FAST + SAFE)
       # =========================
       - name: Extract partitions
         run: |
@@ -147,7 +144,7 @@ jobs:
       # =========================
       # 9. COLLECT APKs + build.prop
       # =========================
-      - name: Collect APKs + properties
+      - name: Collect APKs and properties
         run: |
           mkdir output
 
@@ -169,13 +166,13 @@ jobs:
             find "$part" -name "build.prop" \
               -exec cp -n {} "output/$name/" \; 2>/dev/null || true
 
-            # optional file
+            # optional user file
             if [ -n "${{ github.event.inputs.extra_file }}" ]; then
               find "$part" -name "${{ github.event.inputs.extra_file }}" \
                 -exec cp -n {} "output/$name/" \; 2>/dev/null || true
             fi
 
-            # zip output (fast mode)
+            # zip per partition (fast mode)
             cd output
             zip -qr -0 "../${name}.zip" "$name" || true
             cd ..
@@ -190,11 +187,11 @@ jobs:
       # =========================
       - name: Generate logs
         run: |
-          echo "ROM ANALYSIS REPORT (2026)" > logs.txt
+          echo "ROM ANALYSIS REPORT" > logs.txt
           echo "Date: $(date)" >> logs.txt
           echo "ROM: ${{ github.event.inputs.rom_url }}" >> logs.txt
 
-          echo "Files processed:" >> logs.txt
+          echo "Files:" >> logs.txt
           find . -type f >> logs.txt
 
       # =========================
@@ -203,173 +200,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ROM-PRO-2026-STABLE
-          path: |
-            *.zip
-            logs.txt
-            work/
-            super_out/
-            extracted/      # =========================
-      - name: Install lpunpack
-        run: |
-          wget -q https://github.com/unix3dgforce/lpunpack/releases/download/v1.0/lpunpack
-          chmod +x lpunpack
-
-      # =========================
-      # 3. DOWNLOAD ROM (WITH RETRY)
-      # =========================
-      - name: Download ROM (retry safe)
-        run: |
-          for i in 1 2 3; do
-            wget -O rom.zip "${{ github.event.inputs.rom_url }}" && break
-            echo "Retry $i failed..." && sleep 5
-          done
-
-      # =========================
-      # 4. EXTRACT ROM (MULTI FALLBACK)
-      # =========================
-      - name: Extract ROM
-        run: |
-          mkdir rom
-
-          unzip -q rom.zip -d rom || \
-          7z x rom.zip -orom -y || \
-          (echo "Extraction failed" && exit 1)
-
-      # =========================
-      # 5. LOCATE SUPER IMAGE
-      # =========================
-      - name: Detect super.img
-        run: |
-          mkdir work
-
-          find rom -iname "super.img*" -exec cp {} work/ \; || true
-
-          if ls work/super.img.* 1>/dev/null 2>&1; then
-            echo "Merging split super.img"
-            cat work/super.img.* > work/super.img
-          fi
-
-          if [ ! -f work/super.img ]; then
-            cp work/super.img* work/super.img || true
-          fi
-
-          if [ ! -f work/super.img ]; then
-            echo "❌ super.img not found" && exit 1
-          fi
-
-      # =========================
-      # 6. CONVERT SPARSE IF NEEDED
-      # =========================
-      - name: Normalize image (sparse -> raw)
-        run: |
-          cd work
-
-          file super.img
-
-          simg2img super.img super.raw.img || \
-          cp super.img super.raw.img
-
-      # =========================
-      # 7. UNPACK SUPER (CRITICAL STEP)
-      # =========================
-      - name: Unpack super.img
-        run: |
-          mkdir super_out
-
-          ./lpunpack work/super.raw.img super_out || {
-            echo "lpunpack failed, retrying..."
-            sleep 2
-            ./lpunpack work/super.raw.img super_out || exit 1
-          }
-
-      # =========================
-      # 8. EXTRACT PARTITIONS (PARALLEL + FALLBACK)
-      # =========================
-      - name: Extract partitions (fast + safe)
-        run: |
-          mkdir extracted
-
-          process() {
-            img="$1"
-            name=$(basename "$img")
-            out="extracted/$name"
-            mkdir -p "$out"
-
-            echo "Processing $img"
-
-            # EROFS path
-            if fsck.erofs "$img" >/dev/null 2>&1; then
-              extract.erofs -i "$img" -o "$out" >/dev/null 2>&1 || true
-              return
-            fi
-
-            # EXT / fallback
-            7z x "$img" -o"$out" -y >/dev/null 2>&1 || true
-          }
-
-          export -f process
-
-          find super_out -name "*.img" | xargs -P 4 -I {} bash -c 'process "$@"' _ {}
-
-      # =========================
-      # 9. COLLECT APK + PROPS (SMART FILTER)
-      # =========================
-      - name: Collect APKs + build.prop
-        run: |
-          mkdir output
-
-          collect() {
-            part="$1"
-            name=$(basename "$part")
-            mkdir -p "output/$name"
-
-            echo "Collecting from $part"
-
-            # APK collection (fast single scan)
-            find "$part" -type f \( \
-              -path "*/app/*" -o \
-              -path "*/priv-app/*" -o \
-              -path "*/data-app/*" \
-            \) -name "*.apk" -exec cp -n {} "output/$name/" \; 2>/dev/null || true
-
-            # build.prop
-            find "$part" -name "build.prop" -exec cp -n {} "output/$name/" \; 2>/dev/null || true
-
-            # optional file
-            if [ -n "${{ github.event.inputs.extra_file }}" ]; then
-              find "$part" -name "${{ github.event.inputs.extra_file }}" \
-                -exec cp -n {} "output/$name/" \; 2>/dev/null || true
-            fi
-
-            # compress (fast mode)
-            cd output
-            zip -qr -0 "../${name}.zip" "$name" || true
-            cd ..
-          }
-
-          export -f collect
-
-          find extracted -maxdepth 1 -type d | tail -n +2 | \
-          xargs -P 4 -I {} bash -c 'collect "$@"' _ {}
-
-      # =========================
-      # 10. LOGGING SYSTEM
-      # =========================
-      - name: Save logs
-        run: |
-          echo "ROM ANALYSIS LOG" > logs.txt
-          echo "Date: $(date)" >> logs.txt
-          echo "Files processed:" >> logs.txt
-          find . -maxdepth 3 -type f >> logs.txt
-
-      # =========================
-      # 11. UPLOAD RESULTS
-      # =========================
-      - name: Upload artifacts (final)
-        uses: actions/upload-artifact@v4
-        with:
-          name: ROM-PRO-2026
+          name: ROM-PRO-MIRROR
           path: |
             *.zip
             logs.txt
