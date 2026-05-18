@@ -1,0 +1,132 @@
+name: ROM Analyzer PRO
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: "ROM URL"
+        required: true
+      extra_file:
+        description: "Optional file (build.prop, etc.)"
+        required: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ⚡ FAST BASE SETUP
+      - name: Install tools (minimal)
+        run: |
+          sudo apt update
+          sudo apt install -y unzip p7zip-full simg2img erofs-utils zip
+
+      - name: Install lpunpack
+        run: |
+          wget -q https://github.com/unix3dgforce/lpunpack/releases/download/v1.0/lpunpack
+          chmod +x lpunpack
+
+      # 📥 DOWNLOAD
+      - name: Download ROM
+        run: |
+          wget -O rom.zip "${{ github.event.inputs.rom_url }}"
+
+      # 📦 EXTRACT (fast fallback chain)
+      - name: Extract ROM
+        run: |
+          mkdir rom
+          unzip -q rom.zip -d rom || 7z x rom.zip -orom -y
+
+      # 🔍 FIND + NORMALIZE super.img
+      - name: Prepare super.img
+        run: |
+          mkdir work
+          find rom -iname "super.img*" -exec cp {} work/ \;
+
+          cd work
+
+          # merge if split
+          if ls super.img.* 1> /dev/null 2>&1; then
+            cat super.img.* > super.img
+          fi
+
+          # fallback single file
+          [ -f super.img ] || cp super.img* super.img
+
+      # ⚡ FAST CONVERT (only if needed)
+      - name: Normalize image
+        run: |
+          cd work
+          simg2img super.img super.raw.img 2>/dev/null || cp super.img super.raw.img
+
+      # 🚀 SUPER UNPACK (critical step)
+      - name: Unpack super
+        run: |
+          mkdir super_out
+          ./lpunpack work/super.raw.img super_out
+
+      # ⚡ PARALLEL PARTITION PROCESSING
+      - name: Extract partitions (FAST MODE)
+        run: |
+          mkdir extracted
+
+          process_img () {
+            img=$1
+            base=$(basename "$img")
+            out="extracted/$base"
+            mkdir -p "$out"
+
+            # EROFS fast path
+            if fsck.erofs "$img" >/dev/null 2>&1; then
+              extract.erofs -i "$img" -o "$out" >/dev/null 2>&1
+              return
+            fi
+
+            # EXT fallback (fast 7z mode)
+            7z x "$img" -o"$out" -y >/dev/null 2>&1
+          }
+
+          export -f process_img
+          find super_out -name "*.img" | xargs -P 4 -I {} bash -c 'process_img "$@"' _ {}
+
+      # 📱 ULTRA FAST APK + PROP COLLECT
+      - name: Collect APKs + build.prop
+        run: |
+          mkdir output
+
+          process_partition () {
+            part=$1
+            name=$(basename "$part")
+            mkdir -p "output/$name"
+
+            # APKs (single pass)
+            find "$part" -type f \( -path "*/app/*" -o -path "*/priv-app/*" -o -path "*/data-app/*" \) -name "*.apk" \
+              -exec cp -n {} "output/$name/" \;
+
+            # build.prop (fast direct copy)
+            find "$part" -name "build.prop" \
+              -exec cp -n {} "output/$name/" \;
+
+            # optional file
+            if [ -n "${{ github.event.inputs.extra_file }}" ]; then
+              find "$part" -name "${{ github.event.inputs.extra_file }}" \
+                -exec cp -n {} "output/$name/" \;
+            fi
+
+            # compress (fast zip, no compression level overhead)
+            cd output
+            zip -qr -0 "../${name}.zip" "$name"
+            cd ..
+          }
+
+          export -f process_partition
+          find extracted -maxdepth 1 -type d | tail -n +2 | xargs -P 4 -I {} bash -c 'process_partition "$@"' _ {}
+
+      # 📦 UPLOAD ONLY FINAL OUTPUTS (clean)
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ROM-RESULTS
+          path: |
+            *.zip
