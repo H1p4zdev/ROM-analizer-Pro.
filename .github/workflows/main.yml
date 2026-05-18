@@ -1,4 +1,4 @@
-name: ROM Analyzer PRO 2026
+name: ROM Analyzer PRO 2026 Stable
 
 on:
   workflow_dispatch:
@@ -17,24 +17,199 @@ jobs:
     continue-on-error: true
 
     steps:
+
       # =========================
-      # 1. SAFE INSTALL (2026 FIXED)
+      # 1. INSTALL DEPENDENCIES (2026 FIXED)
       # =========================
-      - name: Install dependencies (2026 safe)
+      - name: Install system tools
         run: |
           sudo apt update
           sudo apt install -y \
-            unzip \
-            zip \
+            unzip zip \
             p7zip-full \
             erofs-utils \
             android-sdk-libsparse-utils \
-            wget \
-            coreutils
+            git cmake build-essential liblz4-dev libzstd-dev wget
 
       # =========================
-      # 2. INSTALL LPUNPACK
+      # 2. BUILD LPUNPACK FROM AOSP (IMPORTANT FIX)
       # =========================
+      - name: Build lpunpack (AOSP safe build)
+        run: |
+          git clone https://android.googlesource.com/platform/system/extras
+          cd extras
+
+          mkdir build && cd build
+          cmake ../liblp/tools
+          make -j$(nproc)
+
+          cp lpunpack $GITHUB_WORKSPACE/lpunpack
+          chmod +x $GITHUB_WORKSPACE/lpunpack
+
+      # =========================
+      # 3. DOWNLOAD ROM (WITH RETRY)
+      # =========================
+      - name: Download ROM
+        run: |
+          for i in 1 2 3; do
+            wget -O rom.zip "${{ github.event.inputs.rom_url }}" && break
+            echo "Retry $i..." && sleep 5
+          done
+
+      # =========================
+      # 4. EXTRACT ROM (SAFE FALLBACK)
+      # =========================
+      - name: Extract ROM
+        run: |
+          mkdir rom
+
+          unzip -q rom.zip -d rom || \
+          7z x rom.zip -orom -y || \
+          (echo "ROM extraction failed" && exit 1)
+
+      # =========================
+      # 5. FIND + NORMALIZE super.img
+      # =========================
+      - name: Prepare super.img
+        run: |
+          mkdir work
+
+          find rom -iname "super.img*" -exec cp {} work/ \; || true
+
+          cd work
+
+          # merge split parts
+          if ls super.img.* 1>/dev/null 2>&1; then
+            echo "Merging split super.img"
+            cat super.img.* > super.img
+          fi
+
+          # fallback single file
+          [ -f super.img ] || cp super.img* super.img || true
+
+          if [ ! -f super.img ]; then
+            echo "ERROR: super.img not found"
+            exit 1
+          fi
+
+      # =========================
+      # 6. CONVERT SPARSE IMAGE
+      # =========================
+      - name: Normalize image
+        run: |
+          cd work
+
+          file super.img
+
+          simg2img super.img super.raw.img || cp super.img super.raw.img
+
+      # =========================
+      # 7. UNPACK SUPER PARTITIONS
+      # =========================
+      - name: Unpack super image
+        run: |
+          mkdir super_out
+
+          ./lpunpack work/super.raw.img super_out || {
+            echo "lpunpack failed, retrying..."
+            sleep 3
+            ./lpunpack work/super.raw.img super_out || exit 1
+          }
+
+      # =========================
+      # 8. EXTRACT PARTITIONS (PARALLEL SAFE MODE)
+      # =========================
+      - name: Extract partitions
+        run: |
+          mkdir extracted
+
+          process() {
+            img="$1"
+            name=$(basename "$img")
+            out="extracted/$name"
+            mkdir -p "$out"
+
+            echo "Processing $name"
+
+            # EROFS
+            if fsck.erofs "$img" >/dev/null 2>&1; then
+              extract.erofs -i "$img" -o "$out" >/dev/null 2>&1 || true
+              return
+            fi
+
+            # EXT fallback
+            7z x "$img" -o"$out" -y >/dev/null 2>&1 || true
+          }
+
+          export -f process
+          find super_out -name "*.img" | xargs -P 4 -I {} bash -c 'process "$@"' _ {}
+
+      # =========================
+      # 9. COLLECT APKs + build.prop
+      # =========================
+      - name: Collect APKs + properties
+        run: |
+          mkdir output
+
+          collect() {
+            part="$1"
+            name=$(basename "$part")
+            mkdir -p "output/$name"
+
+            echo "Scanning $name"
+
+            # APKs
+            find "$part" -type f \( \
+              -path "*/app/*" -o \
+              -path "*/priv-app/*" -o \
+              -path "*/data-app/*" \
+            \) -name "*.apk" -exec cp -n {} "output/$name/" \; 2>/dev/null || true
+
+            # build.prop
+            find "$part" -name "build.prop" \
+              -exec cp -n {} "output/$name/" \; 2>/dev/null || true
+
+            # optional file
+            if [ -n "${{ github.event.inputs.extra_file }}" ]; then
+              find "$part" -name "${{ github.event.inputs.extra_file }}" \
+                -exec cp -n {} "output/$name/" \; 2>/dev/null || true
+            fi
+
+            # zip output (fast mode)
+            cd output
+            zip -qr -0 "../${name}.zip" "$name" || true
+            cd ..
+          }
+
+          export -f collect
+          find extracted -maxdepth 1 -type d | tail -n +2 | \
+          xargs -P 4 -I {} bash -c 'collect "$@"' _ {}
+
+      # =========================
+      # 10. LOG SYSTEM
+      # =========================
+      - name: Generate logs
+        run: |
+          echo "ROM ANALYSIS REPORT (2026)" > logs.txt
+          echo "Date: $(date)" >> logs.txt
+          echo "ROM: ${{ github.event.inputs.rom_url }}" >> logs.txt
+
+          echo "Files processed:" >> logs.txt
+          find . -type f >> logs.txt
+
+      # =========================
+      # 11. UPLOAD RESULTS
+      # =========================
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ROM-PRO-2026-STABLE
+          path: |
+            *.zip
+            logs.txt
+            work/
+            super_out/
+            extracted/      # =========================
       - name: Install lpunpack
         run: |
           wget -q https://github.com/unix3dgforce/lpunpack/releases/download/v1.0/lpunpack
