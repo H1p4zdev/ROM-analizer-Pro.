@@ -1,4 +1,4 @@
-name: ROM Analyzer PRO (Mirror Binary)
+name: ROM APK Extractor (Telegram Individual Upload)
 
 on:
   workflow_dispatch:
@@ -6,56 +6,45 @@ on:
       rom_url:
         description: "ROM URL"
         required: true
-      extra_file:
-        description: "Optional file (e.g. boot.prop, *.xml)"
+
+      telegram_bot_token:
+        description: "Telegram Bot Token (optional)"
+        required: false
+
+      telegram_chat_id:
+        description: "Telegram Chat ID (optional)"
         required: false
 
 jobs:
-  analyze:
+  extract:
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    continue-on-error: true
 
     steps:
 
       # =========================
-      # 1. INSTALL DEPENDENCIES (2026 SAFE)
+      # 1. INSTALL TOOLS
       # =========================
-      - name: Install system tools
+      - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y \
-            unzip zip \
-            p7zip-full \
-            erofs-utils \
-            android-sdk-libsparse-utils \
-            wget
+          sudo apt install -y unzip zip p7zip-full wget simg2img erofs-utils
 
       # =========================
-      # 2. GET LPUNPACK (MIRROR BINARY)
+      # 2. GET LPUNPACK (MIRROR)
       # =========================
-      - name: Download lpunpack binary
+      - name: Setup lpunpack
         run: |
           git clone https://github.com/whyshhnuv/lpunpack-lpmake-mirror.git tools
-
           chmod +x tools/binary/lpunpack
-          chmod +x tools/binary/lpmake
-
           cp tools/binary/lpunpack $GITHUB_WORKSPACE/lpunpack
-          cp tools/binary/lpmake $GITHUB_WORKSPACE/lpmake
-
-          echo "Checking binary:"
-          file lpunpack || true
 
       # =========================
       # 3. DOWNLOAD ROM
       # =========================
       - name: Download ROM
         run: |
-          for i in 1 2 3; do
-            wget -O rom.zip "${{ github.event.inputs.rom_url }}" && break
-            echo "Retry $i..." && sleep 5
-          done
+          wget -O rom.zip "${{ github.event.inputs.rom_url }}"
 
       # =========================
       # 4. EXTRACT ROM
@@ -66,144 +55,117 @@ jobs:
           unzip -q rom.zip -d rom || 7z x rom.zip -orom -y
 
       # =========================
-      # 5. FIND + MERGE super.img
+      # 5. FIND + MERGE SUPER
       # =========================
       - name: Prepare super.img
         run: |
           mkdir work
-
           find rom -iname "super.img*" -exec cp {} work/ \; || true
-          cd work
 
-          # merge split parts
+          cd work
           if ls super.img.* 1>/dev/null 2>&1; then
-            echo "Merging split super.img"
             cat super.img.* > super.img
           fi
 
-          # fallback single file
-          [ -f super.img ] || cp super.img* super.img || true
-
-          if [ ! -f super.img ]; then
-            echo "ERROR: super.img not found"
-            exit 1
-          fi
-
       # =========================
-      # 6. HANDLE SPARSE IMAGE
+      # 6. CONVERT SPARSE
       # =========================
       - name: Normalize image
         run: |
           cd work
-
-          file super.img
-
           simg2img super.img super.raw.img || cp super.img super.raw.img
 
       # =========================
-      # 7. UNPACK SUPER USING YOUR BINARY
+      # 7. UNPACK SUPER
       # =========================
-      - name: Unpack super.img
+      - name: Unpack partitions
         run: |
-          mkdir super_out
-
-          ./lpunpack work/super.raw.img super_out || {
-            echo "lpunpack failed, retrying..."
-            sleep 2
-            ./lpunpack work/super.raw.img super_out || exit 1
-          }
+          mkdir out
+          ./lpunpack work/super.raw.img out/
 
       # =========================
-      # 8. EXTRACT PARTITIONS (FAST + SAFE)
+      # 8. EXTRACT APK ONLY (NO PROP IN TELEGRAM MODE)
       # =========================
-      - name: Extract partitions
+      - name: Extract APKs only
         run: |
-          mkdir extracted
+          mkdir apk_out
 
           process() {
             img="$1"
             name=$(basename "$img")
-            out="extracted/$name"
-            mkdir -p "$out"
 
-            echo "Processing $name"
+            mkdir tmp
 
-            # EROFS
-            if fsck.erofs "$img" >/dev/null 2>&1; then
-              extract.erofs -i "$img" -o "$out" >/dev/null 2>&1 || true
-              return
-            fi
+            7z x "$img" -otmp >/dev/null 2>&1 || true
 
-            # EXT fallback
-            7z x "$img" -o"$out" -y >/dev/null 2>&1 || true
-          }
-
-          export -f process
-          find super_out -name "*.img" | xargs -P 4 -I {} bash -c 'process "$@"' _ {}
-
-      # =========================
-      # 9. COLLECT APKs + build.prop
-      # =========================
-      - name: Collect APKs and properties
-        run: |
-          mkdir output
-
-          collect() {
-            part="$1"
-            name=$(basename "$part")
-            mkdir -p "output/$name"
-
-            echo "Scanning $name"
-
-            # APKs
-            find "$part" -type f \( \
+            find tmp -type f \( \
               -path "*/app/*" -o \
               -path "*/priv-app/*" -o \
               -path "*/data-app/*" \
-            \) -name "*.apk" -exec cp -n {} "output/$name/" \; 2>/dev/null || true
+            \) -name "*.apk" -exec cp -n {} apk_out/ \; || true
 
-            # build.prop
-            find "$part" -name "build.prop" \
-              -exec cp -n {} "output/$name/" \; 2>/dev/null || true
-
-            # optional user file
-            if [ -n "${{ github.event.inputs.extra_file }}" ]; then
-              find "$part" -name "${{ github.event.inputs.extra_file }}" \
-                -exec cp -n {} "output/$name/" \; 2>/dev/null || true
-            fi
-
-            # zip per partition (fast mode)
-            cd output
-            zip -qr -0 "../${name}.zip" "$name" || true
-            cd ..
+            rm -rf tmp
           }
 
-          export -f collect
-          find extracted -maxdepth 1 -type d | tail -n +2 | \
-          xargs -P 4 -I {} bash -c 'collect "$@"' _ {}
+          export -f process
+          find out -name "*.img" | xargs -I {} bash -c 'process "$@"' _ {}
 
       # =========================
-      # 10. LOG SYSTEM
+      # 9. SHOW ZIP SIZE
       # =========================
-      - name: Generate logs
+      - name: Create ZIP + show size
         run: |
-          echo "ROM ANALYSIS REPORT" > logs.txt
-          echo "Date: $(date)" >> logs.txt
-          echo "ROM: ${{ github.event.inputs.rom_url }}" >> logs.txt
+          zip -r apks.zip apk_out
 
-          echo "Files:" >> logs.txt
-          find . -type f >> logs.txt
+          echo "===================="
+          echo "ZIP SIZE INFO"
+          echo "===================="
+
+          ls -lh apks.zip
+
+          echo "Size (bytes):"
+          stat -c%s apks.zip
 
       # =========================
-      # 11. UPLOAD RESULTS
+      # 10. TELEGRAM: SEND APKS INDIVIDUALLY
       # =========================
-      - name: Upload artifacts
+      - name: Upload APKs to Telegram individually
+        run: |
+          if [ -z "${{ github.event.inputs.telegram_bot_token }}" ] || [ -z "${{ github.event.inputs.telegram_chat_id }}" ]; then
+            echo "Telegram not configured, skipping."
+            exit 0
+          fi
+
+          TOKEN="${{ github.event.inputs.telegram_bot_token }}"
+          CHAT="${{ github.event.inputs.telegram_chat_id }}"
+
+          mkdir split_apk
+
+          # Copy APKs safely
+          cp apk_out/*.apk split_apk/ 2>/dev/null || true
+
+          count=0
+
+          for apk in split_apk/*.apk; do
+            [ -e "$apk" ] || continue
+
+            count=$((count+1))
+            echo "Uploading APK $count: $apk"
+
+            curl -s -F document=@"$apk" \
+              "https://api.telegram.org/bot$TOKEN/sendDocument" \
+              -F chat_id="$CHAT" || true
+
+            sleep 1
+          done
+
+          echo "Total APKs sent: $count"
+
+      # =========================
+      # 11. GITHUB ARTIFACT (OPTIONAL BACKUP)
+      # =========================
+      - name: Upload ZIP backup
         uses: actions/upload-artifact@v4
         with:
-          name: ROM-PRO-MIRROR
-          path: |
-            *.zip
-            logs.txt
-            work/
-            super_out/
-            extracted/
+          name: APK-ONLY-ZIP
+          path: apks.zip
