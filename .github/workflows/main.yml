@@ -1,4 +1,4 @@
-name: ROM APK Extractor (Telegram Individual Upload)
+name: ROM APK Extractor (Lite + Telegram)
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ on:
         required: false
 
 jobs:
-  extract:
+  analyze:
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -28,10 +28,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y unzip zip p7zip-full wget simg2img erofs-utils
+          sudo apt install -y unzip zip p7zip-full wget erofs-utils android-sdk-libsparse-utils
 
       # =========================
-      # 2. GET LPUNPACK (MIRROR)
+      # 2. LPUNPACK BINARY
       # =========================
       - name: Setup lpunpack
         run: |
@@ -55,36 +55,42 @@ jobs:
           unzip -q rom.zip -d rom || 7z x rom.zip -orom -y
 
       # =========================
-      # 5. FIND + MERGE SUPER
+      # 5. PREPARE SUPER
       # =========================
       - name: Prepare super.img
         run: |
           mkdir work
-          find rom -iname "super.img*" -exec cp {} work/ \; || true
 
+          find rom -iname "super.img*" -exec cp {} work/ \; || true
           cd work
+
           if ls super.img.* 1>/dev/null 2>&1; then
             cat super.img.* > super.img
           fi
 
       # =========================
-      # 6. CONVERT SPARSE
+      # 6. SAFE SPARSE HANDLING
       # =========================
       - name: Normalize image
         run: |
           cd work
-          simg2img super.img super.raw.img || cp super.img super.raw.img
+
+          if command -v simg2img >/dev/null 2>&1; then
+            simg2img super.img super.raw.img || cp super.img super.raw.img
+          else
+            cp super.img super.raw.img
+          fi
 
       # =========================
       # 7. UNPACK SUPER
       # =========================
       - name: Unpack partitions
         run: |
-          mkdir out
-          ./lpunpack work/super.raw.img out/
+          mkdir super_out
+          ./lpunpack work/super.raw.img super_out
 
       # =========================
-      # 8. EXTRACT APK ONLY (NO PROP IN TELEGRAM MODE)
+      # 8. EXTRACT APK ONLY
       # =========================
       - name: Extract APKs only
         run: |
@@ -92,10 +98,8 @@ jobs:
 
           process() {
             img="$1"
-            name=$(basename "$img")
 
             mkdir tmp
-
             7z x "$img" -otmp >/dev/null 2>&1 || true
 
             find tmp -type f \( \
@@ -108,49 +112,28 @@ jobs:
           }
 
           export -f process
-          find out -name "*.img" | xargs -I {} bash -c 'process "$@"' _ {}
+          find super_out -name "*.img" | xargs -I {} bash -c 'process "$@"' _ {}
 
       # =========================
-      # 9. SHOW ZIP SIZE
-      # =========================
-      - name: Create ZIP + show size
-        run: |
-          zip -r apks.zip apk_out
-
-          echo "===================="
-          echo "ZIP SIZE INFO"
-          echo "===================="
-
-          ls -lh apks.zip
-
-          echo "Size (bytes):"
-          stat -c%s apks.zip
-
-      # =========================
-      # 10. TELEGRAM: SEND APKS INDIVIDUALLY
+      # 9. TELEGRAM UPLOAD (INDIVIDUAL APKS)
       # =========================
       - name: Upload APKs to Telegram individually
         run: |
           if [ -z "${{ github.event.inputs.telegram_bot_token }}" ] || [ -z "${{ github.event.inputs.telegram_chat_id }}" ]; then
-            echo "Telegram not configured, skipping."
+            echo "Telegram not configured. Skipping upload."
             exit 0
           fi
 
           TOKEN="${{ github.event.inputs.telegram_bot_token }}"
           CHAT="${{ github.event.inputs.telegram_chat_id }}"
 
-          mkdir split_apk
-
-          # Copy APKs safely
-          cp apk_out/*.apk split_apk/ 2>/dev/null || true
-
           count=0
 
-          for apk in split_apk/*.apk; do
+          for apk in apk_out/*.apk; do
             [ -e "$apk" ] || continue
 
             count=$((count+1))
-            echo "Uploading APK $count: $apk"
+            echo "Uploading [$count]: $apk"
 
             curl -s -F document=@"$apk" \
               "https://api.telegram.org/bot$TOKEN/sendDocument" \
@@ -159,13 +142,26 @@ jobs:
             sleep 1
           done
 
-          echo "Total APKs sent: $count"
+          echo "Total APKs uploaded: $count"
 
       # =========================
-      # 11. GITHUB ARTIFACT (OPTIONAL BACKUP)
+      # 10. OPTIONAL ARTIFACT (SMALL BACKUP ONLY)
       # =========================
-      - name: Upload ZIP backup
+      - name: Upload APK ZIP backup
+        run: |
+          zip -r apk_only.zip apk_out
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: APK-ONLY-ZIP
-          path: apks.zip
+          name: APK-ONLY
+          path: apk_only.zip
+
+      # =========================
+      # 11. CLEANUP (CRITICAL FOR SIZE CONTROL)
+      # =========================
+      - name: Cleanup heavy files
+        run: |
+          rm -rf rom
+          rm -rf work
+          rm -rf super_out
