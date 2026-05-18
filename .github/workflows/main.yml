@@ -1,4 +1,4 @@
-name: ROM Analyzer PRO
+name: ROM Analyzer PRO 2026
 
 on:
   workflow_dispatch:
@@ -13,120 +13,191 @@ on:
 jobs:
   analyze:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
+    continue-on-error: true
 
     steps:
-      # ⚡ FAST BASE SETUP
-      - name: Install tools (minimal)
+      # =========================
+      # 1. SAFE INSTALL (2026 FIXED)
+      # =========================
+      - name: Install dependencies (2026 safe)
         run: |
           sudo apt update
-          sudo apt install -y unzip p7zip-full simg2img erofs-utils zip
+          sudo apt install -y \
+            unzip \
+            zip \
+            p7zip-full \
+            erofs-utils \
+            android-sdk-libsparse-utils \
+            wget \
+            coreutils
 
+      # =========================
+      # 2. INSTALL LPUNPACK
+      # =========================
       - name: Install lpunpack
         run: |
           wget -q https://github.com/unix3dgforce/lpunpack/releases/download/v1.0/lpunpack
           chmod +x lpunpack
 
-      # 📥 DOWNLOAD
-      - name: Download ROM
+      # =========================
+      # 3. DOWNLOAD ROM (WITH RETRY)
+      # =========================
+      - name: Download ROM (retry safe)
         run: |
-          wget -O rom.zip "${{ github.event.inputs.rom_url }}"
+          for i in 1 2 3; do
+            wget -O rom.zip "${{ github.event.inputs.rom_url }}" && break
+            echo "Retry $i failed..." && sleep 5
+          done
 
-      # 📦 EXTRACT (fast fallback chain)
+      # =========================
+      # 4. EXTRACT ROM (MULTI FALLBACK)
+      # =========================
       - name: Extract ROM
         run: |
           mkdir rom
-          unzip -q rom.zip -d rom || 7z x rom.zip -orom -y
 
-      # 🔍 FIND + NORMALIZE super.img
-      - name: Prepare super.img
+          unzip -q rom.zip -d rom || \
+          7z x rom.zip -orom -y || \
+          (echo "Extraction failed" && exit 1)
+
+      # =========================
+      # 5. LOCATE SUPER IMAGE
+      # =========================
+      - name: Detect super.img
         run: |
           mkdir work
-          find rom -iname "super.img*" -exec cp {} work/ \;
 
-          cd work
+          find rom -iname "super.img*" -exec cp {} work/ \; || true
 
-          # merge if split
-          if ls super.img.* 1> /dev/null 2>&1; then
-            cat super.img.* > super.img
+          if ls work/super.img.* 1>/dev/null 2>&1; then
+            echo "Merging split super.img"
+            cat work/super.img.* > work/super.img
           fi
 
-          # fallback single file
-          [ -f super.img ] || cp super.img* super.img
+          if [ ! -f work/super.img ]; then
+            cp work/super.img* work/super.img || true
+          fi
 
-      # ⚡ FAST CONVERT (only if needed)
-      - name: Normalize image
+          if [ ! -f work/super.img ]; then
+            echo "❌ super.img not found" && exit 1
+          fi
+
+      # =========================
+      # 6. CONVERT SPARSE IF NEEDED
+      # =========================
+      - name: Normalize image (sparse -> raw)
         run: |
           cd work
-          simg2img super.img super.raw.img 2>/dev/null || cp super.img super.raw.img
 
-      # 🚀 SUPER UNPACK (critical step)
-      - name: Unpack super
+          file super.img
+
+          simg2img super.img super.raw.img || \
+          cp super.img super.raw.img
+
+      # =========================
+      # 7. UNPACK SUPER (CRITICAL STEP)
+      # =========================
+      - name: Unpack super.img
         run: |
           mkdir super_out
-          ./lpunpack work/super.raw.img super_out
 
-      # ⚡ PARALLEL PARTITION PROCESSING
-      - name: Extract partitions (FAST MODE)
+          ./lpunpack work/super.raw.img super_out || {
+            echo "lpunpack failed, retrying..."
+            sleep 2
+            ./lpunpack work/super.raw.img super_out || exit 1
+          }
+
+      # =========================
+      # 8. EXTRACT PARTITIONS (PARALLEL + FALLBACK)
+      # =========================
+      - name: Extract partitions (fast + safe)
         run: |
           mkdir extracted
 
-          process_img () {
-            img=$1
-            base=$(basename "$img")
-            out="extracted/$base"
+          process() {
+            img="$1"
+            name=$(basename "$img")
+            out="extracted/$name"
             mkdir -p "$out"
 
-            # EROFS fast path
+            echo "Processing $img"
+
+            # EROFS path
             if fsck.erofs "$img" >/dev/null 2>&1; then
-              extract.erofs -i "$img" -o "$out" >/dev/null 2>&1
+              extract.erofs -i "$img" -o "$out" >/dev/null 2>&1 || true
               return
             fi
 
-            # EXT fallback (fast 7z mode)
-            7z x "$img" -o"$out" -y >/dev/null 2>&1
+            # EXT / fallback
+            7z x "$img" -o"$out" -y >/dev/null 2>&1 || true
           }
 
-          export -f process_img
-          find super_out -name "*.img" | xargs -P 4 -I {} bash -c 'process_img "$@"' _ {}
+          export -f process
 
-      # 📱 ULTRA FAST APK + PROP COLLECT
+          find super_out -name "*.img" | xargs -P 4 -I {} bash -c 'process "$@"' _ {}
+
+      # =========================
+      # 9. COLLECT APK + PROPS (SMART FILTER)
+      # =========================
       - name: Collect APKs + build.prop
         run: |
           mkdir output
 
-          process_partition () {
-            part=$1
+          collect() {
+            part="$1"
             name=$(basename "$part")
             mkdir -p "output/$name"
 
-            # APKs (single pass)
-            find "$part" -type f \( -path "*/app/*" -o -path "*/priv-app/*" -o -path "*/data-app/*" \) -name "*.apk" \
-              -exec cp -n {} "output/$name/" \;
+            echo "Collecting from $part"
 
-            # build.prop (fast direct copy)
-            find "$part" -name "build.prop" \
-              -exec cp -n {} "output/$name/" \;
+            # APK collection (fast single scan)
+            find "$part" -type f \( \
+              -path "*/app/*" -o \
+              -path "*/priv-app/*" -o \
+              -path "*/data-app/*" \
+            \) -name "*.apk" -exec cp -n {} "output/$name/" \; 2>/dev/null || true
+
+            # build.prop
+            find "$part" -name "build.prop" -exec cp -n {} "output/$name/" \; 2>/dev/null || true
 
             # optional file
             if [ -n "${{ github.event.inputs.extra_file }}" ]; then
               find "$part" -name "${{ github.event.inputs.extra_file }}" \
-                -exec cp -n {} "output/$name/" \;
+                -exec cp -n {} "output/$name/" \; 2>/dev/null || true
             fi
 
-            # compress (fast zip, no compression level overhead)
+            # compress (fast mode)
             cd output
-            zip -qr -0 "../${name}.zip" "$name"
+            zip -qr -0 "../${name}.zip" "$name" || true
             cd ..
           }
 
-          export -f process_partition
-          find extracted -maxdepth 1 -type d | tail -n +2 | xargs -P 4 -I {} bash -c 'process_partition "$@"' _ {}
+          export -f collect
 
-      # 📦 UPLOAD ONLY FINAL OUTPUTS (clean)
-      - name: Upload results
+          find extracted -maxdepth 1 -type d | tail -n +2 | \
+          xargs -P 4 -I {} bash -c 'collect "$@"' _ {}
+
+      # =========================
+      # 10. LOGGING SYSTEM
+      # =========================
+      - name: Save logs
+        run: |
+          echo "ROM ANALYSIS LOG" > logs.txt
+          echo "Date: $(date)" >> logs.txt
+          echo "Files processed:" >> logs.txt
+          find . -maxdepth 3 -type f >> logs.txt
+
+      # =========================
+      # 11. UPLOAD RESULTS
+      # =========================
+      - name: Upload artifacts (final)
         uses: actions/upload-artifact@v4
         with:
-          name: ROM-RESULTS
+          name: ROM-PRO-2026
           path: |
             *.zip
+            logs.txt
+            work/
+            super_out/
+            extracted/
