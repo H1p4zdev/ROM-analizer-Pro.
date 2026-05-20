@@ -1,0 +1,32 @@
+name: Mirror to PixelDrain
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: "Direct file URL"
+        required: true
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download file
+        run: |
+          mkdir temp
+          cd temp
+          curl -L "${{ github.event.inputs.file_url }}" -o file
+
+      - name: Upload to PixelDrain
+        run: |
+          cd temp
+          RESPONSE=$(curl -X POST https://pixeldrain.com/api/file \
+            -u ":${{ secrets.PIXELDRAIN_API_KEY }}" \
+            -F "file=@file")
+
+          echo "$RESPONSE"
+
+      - name: Save response
+        run: |
+          echo "$RESPONSE" > result.json
