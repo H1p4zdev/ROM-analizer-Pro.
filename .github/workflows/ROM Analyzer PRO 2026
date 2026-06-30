@@ -221,7 +221,38 @@ jobs:
           echo "Total: $(ls super_out/ | wc -l)"
 
       # =========================
-      # 8. EXTRACT PARTITIONS (PARALLEL + FALLBACK)
+      # 8. DISCOVER STANDALONE PARTITIONS
+      # =========================
+      - name: Discover standalone partition images
+        run: |
+          mkdir -p parts
+
+          echo ">>> Searching for standalone partition images in rom/..."
+          while IFS= read -r img; do
+            name=$(basename "$img")
+            if [ -f "super_out/$name" ]; then
+              echo "  ⏭️  $name already in super_out — skipping"
+            else
+              cp -v "$img" "parts/$name"
+            fi
+          done < <(find rom -type f \( \
+            -iname "system.img" -o \
+            -iname "system_ext.img" -o \
+            -iname "product.img" -o \
+            -iname "vendor.img" -o \
+            -iname "vendor_dlkm.img" -o \
+            -iname "odm.img" -o \
+            -iname "odm_dlkm.img" -o \
+            -iname "system_dlkm.img" \
+          \) 2>/dev/null)
+
+          found=$(ls parts/ 2>/dev/null | wc -l)
+          echo ""
+          echo ">>> Standalone partitions found: $found"
+          ls -lh parts/ 2>/dev/null || echo "(none)"
+
+      # =========================
+      # 9. EXTRACT PARTITIONS (PARALLEL + FALLBACK)
       # =========================
       - name: Extract partitions (fast + safe)
         run: |
@@ -273,7 +304,16 @@ jobs:
 
           export -f process
 
-          find super_out -name "*.img" | xargs -P 4 -I {} bash -c 'process "$@"' _ {}
+          echo ">>> Processing super_out/ (lpunpack output)..."
+          find super_out -name "*.img" -type f -size +1M | sort | \
+            xargs -P 4 -I {} bash -c 'process "$@"' _ {}
+
+          echo ""
+          echo ">>> Processing parts/ (standalone images)..."
+          if [ -d parts ]; then
+            find parts -name "*.img" -type f -size +1M | sort | \
+              xargs -P 4 -I {} bash -c 'process "$@"' _ {}
+          fi
 
       # =========================
       # 9. COLLECT APK + PROPS (SMART FILTER)

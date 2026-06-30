@@ -259,7 +259,40 @@ jobs:
           echo "Total: $(ls super_out/ | wc -l)"
 
       # =========================
-      # 8. EXTRACT APK FROM PARTITIONS
+      # 8. DISCOVER STANDALONE PARTITIONS
+      # =========================
+      - name: Discover standalone partition images
+        run: |
+          mkdir -p parts
+
+          echo ">>> Searching for standalone partition images in rom/..."
+          # Common partition image names (excluding super* and boot/recovery)
+          while IFS= read -r img; do
+            name=$(basename "$img")
+            # Skip if already extracted by lpunpack
+            if [ -f "super_out/$name" ]; then
+              echo "  ⏭️  $name already in super_out — skipping"
+            else
+              cp -v "$img" "parts/$name"
+            fi
+          done < <(find rom -type f \( \
+            -iname "system.img" -o \
+            -iname "system_ext.img" -o \
+            -iname "product.img" -o \
+            -iname "vendor.img" -o \
+            -iname "vendor_dlkm.img" -o \
+            -iname "odm.img" -o \
+            -iname "odm_dlkm.img" -o \
+            -iname "system_dlkm.img" \
+          \) 2>/dev/null)
+
+          found=$(ls parts/ 2>/dev/null | wc -l)
+          echo ""
+          echo ">>> Standalone partitions found: $found"
+          ls -lh parts/ 2>/dev/null || echo "(none)"
+
+      # =========================
+      # 9. EXTRACT APK FROM PARTITIONS
       # =========================
       - name: Extract APKs
         run: |
@@ -296,12 +329,10 @@ jobs:
             # Method 3: 7z fallback (sparse images, compressed formats)
             if ! $extracted; then
               7z x "$img" -otmp >/dev/null 2>&1 || true
-              # Check if anything was extracted
               if [ "$(find tmp -type f 2>/dev/null | wc -l)" -gt 0 ]; then
                 echo "  ✅ $name: 7z extraction succeeded"
               else
-                echo "  ⚠️  $name: unknown format — filesystem may need different tool"
-                # Show file type for debugging
+                echo "  ⚠️  $name: unknown format"
                 file "$img" | head -1
               fi
             fi
@@ -328,11 +359,23 @@ jobs:
           }
 
           export -f process
-          find super_out -name "*.img" | sort | xargs -I {} bash -c 'process "$@"' _ {}
+
+          # Process images from lpunpack (super_out) AND standalone partitions (parts)
+          echo ">>> Processing super_out/ (lpunpack output)..."
+          find super_out -name "*.img" -type f -size +1M | sort | \
+            xargs -I {} bash -c 'process "$@"' _ {}
+
+          echo ""
+          echo ">>> Processing parts/ (standalone images)..."
+          if [ -d parts ]; then
+            find parts -name "*.img" -type f -size +1M | sort | \
+              xargs -I {} bash -c 'process "$@"' _ {}
+          fi
 
           echo ""
           echo "============================================"
           echo "Total APKs collected: $(ls apk_out/ 2>/dev/null | wc -l)"
+          ls -lh apk_out/ 2>/dev/null || echo "(empty)"
           echo "============================================"
 
       # =========================
