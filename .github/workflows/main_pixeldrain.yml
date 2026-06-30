@@ -46,7 +46,7 @@ jobs:
             unzip zip p7zip-full \
             wget curl \
             zstd xz-utils lz4 brotli \
-            erofs-utils \
+            erofs-utils f2fs-tools \
             android-sdk-libsparse-utils \
             xxd file
 
@@ -259,7 +259,7 @@ jobs:
           echo "Total: $(ls super_out/ | wc -l)"
 
       # =========================
-      # 8. EXTRACT APK ONLY
+      # 8. EXTRACT APK FROM PARTITIONS
       # =========================
       - name: Extract APKs
         run: |
@@ -267,21 +267,73 @@ jobs:
 
           process() {
             img="$1"
+            name=$(basename "$img")
+
+            echo ""
+            echo ">>> Processing: $name"
 
             mkdir tmp
-            7z x "$img" -otmp >/dev/null 2>&1 || true
 
-            find tmp -type f \( \
-              -path "*/app/*" -o \
-              -path "*/priv-app/*" -o \
-              -path "*/data-app/*" \
-            \) -name "*.apk" -exec cp -n {} apk_out/ \; || true
+            # ---- Try extraction methods in order ----
+            extracted=false
 
+            # Method 1: EROFS (modern ROMs)
+            if command -v extract.erofs &>/dev/null; then
+              if extract.erofs -i "$img" -o tmp &>/dev/null; then
+                echo "  ✅ $name: EROFS format — extracted"
+                extracted=true
+              fi
+            fi
+
+            # Method 2: Loop mount (ext4, f2fs, etc.)
+            if ! $extracted; then
+              if sudo mount -o loop,ro "$img" tmp 2>/dev/null; then
+                echo "  ✅ $name: mounted via loop"
+                extracted=true
+              fi
+            fi
+
+            # Method 3: 7z fallback (sparse images, compressed formats)
+            if ! $extracted; then
+              7z x "$img" -otmp >/dev/null 2>&1 || true
+              # Check if anything was extracted
+              if [ "$(find tmp -type f 2>/dev/null | wc -l)" -gt 0 ]; then
+                echo "  ✅ $name: 7z extraction succeeded"
+              else
+                echo "  ⚠️  $name: unknown format — filesystem may need different tool"
+                # Show file type for debugging
+                file "$img" | head -1
+              fi
+            fi
+
+            # ---- Collect APKs ----
+            apk_count=0
+            if [ -d tmp ]; then
+              while IFS= read -r apk; do
+                cp -n "$apk" apk_out/ 2>/dev/null && apk_count=$((apk_count + 1))
+              done < <(find tmp -type f \( \
+                -path "*/app/*" -o \
+                -path "*/priv-app/*" -o \
+                -path "*/data-app/*" \
+              \) -name "*.apk" 2>/dev/null)
+            fi
+
+            echo "  📱 APKs found: $apk_count"
+
+            # ---- Cleanup ----
+            if mountpoint -q tmp 2>/dev/null; then
+              sudo umount tmp 2>/dev/null || true
+            fi
             rm -rf tmp
           }
 
           export -f process
-          find super_out -name "*.img" | xargs -I {} bash -c 'process "$@"' _ {}
+          find super_out -name "*.img" | sort | xargs -I {} bash -c 'process "$@"' _ {}
+
+          echo ""
+          echo "============================================"
+          echo "Total APKs collected: $(ls apk_out/ 2>/dev/null | wc -l)"
+          echo "============================================"
 
       # =========================
       # 9. CREATE ZIP (ALWAYS REQUIRED)

@@ -27,7 +27,7 @@ jobs:
             unzip zip p7zip-full \
             wget \
             zstd xz-utils lz4 brotli \
-            erofs-utils \
+            erofs-utils f2fs-tools \
             android-sdk-libsparse-utils \
             xxd file \
             coreutils
@@ -233,16 +233,42 @@ jobs:
             out="extracted/$name"
             mkdir -p "$out"
 
-            echo "Processing $img"
+            echo ""
+            echo ">>> Processing: $name"
 
-            # EROFS path
-            if fsck.erofs "$img" >/dev/null 2>&1; then
-              extract.erofs -i "$img" -o "$out" >/dev/null 2>&1 || true
-              return
+            extracted=false
+
+            # Method 1: EROFS (modern ROMs)
+            if command -v extract.erofs &>/dev/null; then
+              if extract.erofs -i "$img" -o "$out" &>/dev/null; then
+                echo "  ✅ $name: EROFS format — extracted"
+                extracted=true
+              fi
             fi
 
-            # EXT / fallback
-            7z x "$img" -o"$out" -y >/dev/null 2>&1 || true
+            # Method 2: Loop mount (ext4, f2fs, etc.)
+            if ! $extracted; then
+              if sudo mount -o loop,ro "$img" "$out" 2>/dev/null; then
+                echo "  ✅ $name: mounted via loop"
+                extracted=true
+              fi
+            fi
+
+            # Method 3: 7z fallback
+            if ! $extracted; then
+              7z x "$img" -o"$out" -y >/dev/null 2>&1 || true
+              if [ "$(find "$out" -type f 2>/dev/null | wc -l)" -gt 0 ]; then
+                echo "  ✅ $name: 7z extraction succeeded"
+              else
+                echo "  ⚠️  $name: unknown format"
+                file "$img" | head -1
+              fi
+            fi
+
+            # If we mounted, remember to unmount later
+            if mountpoint -q "$out" 2>/dev/null; then
+              echo "$out" >> /tmp/mounted_dirs.txt
+            fi
           }
 
           export -f process
