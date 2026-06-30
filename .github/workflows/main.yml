@@ -28,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y unzip zip p7zip-full wget erofs-utils android-sdk-libsparse-utils
+          sudo apt install -y unzip zip p7zip-full wget zstd erofs-utils android-sdk-libsparse-utils
 
       # =========================
       # 2. LPUNPACK BINARY
@@ -64,9 +64,26 @@ jobs:
           find rom -iname "super.img*" -exec cp {} work/ \; || true
           cd work
 
-          if ls super.img.* 1>/dev/null 2>&1; then
-            cat super.img.* > super.img
+          # Decompress .zst if present
+          if [ -f super.img.zst ]; then
+            echo "Decompressing super.img.zst..."
+            zstd -d super.img.zst -o super.img && rm -f super.img.zst
           fi
+
+          # Handle splitted sparse images (super.img.1, super.img.2, ...)
+          shopt -s nullglob
+          parts=( super.img.[0-9]* )
+          if [ ${#parts[@]} -gt 0 ]; then
+            echo "Merging ${#parts[@]} splitted super.img parts..."
+            cat "${parts[@]}" > super.img.merged && mv super.img.merged super.img
+            rm -f super.img.[0-9]*
+          fi
+          shopt -u nullglob
+
+          if [ ! -f super.img ]; then
+            echo "❌ super.img not found after preparation" && exit 1
+          fi
+          echo "✅ super.img ready ($(ls -lh super.img | awk '{print $5}'))"
 
       # =========================
       # 6. SAFE SPARSE HANDLING
