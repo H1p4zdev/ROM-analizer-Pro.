@@ -24,13 +24,12 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y \
-            unzip \
-            zip \
-            p7zip-full \
+            unzip zip p7zip-full \
+            wget \
+            zstd xz-utils lz4 brotli \
             erofs-utils \
             android-sdk-libsparse-utils \
-            wget \
-            zstd \
+            xxd file \
             coreutils
 
       # =========================
@@ -52,7 +51,7 @@ jobs:
           done
 
       # =========================
-      # 4. EXTRACT ROM (MULTI FALLBACK)
+      # 4. EXTRACT ROM (MULTI FALLBACK) + VERIFY
       # =========================
       - name: Extract ROM
         run: |
@@ -62,62 +61,161 @@ jobs:
           7z x rom.zip -orom -y || \
           (echo "Extraction failed" && exit 1)
 
+          echo "========== ROM STRUCTURE (top 3 levels) =========="
+          find rom -maxdepth 3 -type f -o -type d | head -100
+          echo "=================================================="
+          echo "Total files extracted: $(find rom -type f | wc -l)"
+
       # =========================
-      # 5. LOCATE SUPER IMAGE
+      # 5. DISCOVER + PREPARE SUPER IMAGE
       # =========================
       - name: Detect super.img
         run: |
+          set -x
+
           mkdir work
 
-          find rom -iname "super.img*" -exec cp {} work/ \; || true
-          cd work
+          # Step 1: Find all super-related files
+          echo ">>> Searching for super image files..."
+          find rom -type f -iname "super*" 2>/dev/null | sort > /tmp/super_files.txt
+          cat /tmp/super_files.txt
+          echo "---"
 
-          # Decompress .zst if present
-          if [ -f super.img.zst ]; then
-            echo "Decompressing super.img.zst..."
-            zstd -d super.img.zst -o super.img && rm -f super.img.zst
+          # Step 2: Check for payload.bin
+          if find rom -iname "payload.bin" -type f | head -1 | grep -q .; then
+            echo "⚠️  Found payload.bin — ROM uses incremental OTA!"
           fi
 
-          # Handle splitted sparse images (super.img.1, super.img.2, ...)
+          # Step 3: Copy super files to work/
+          find rom -type f \( \
+            -iname "super.img*" -o \
+            -iname "super*image*" -o \
+            -iname "super.raw*" \
+          \) -exec cp -v {} work/ \; 2>/dev/null || true
+
+          find rom -type f -name "super" -exec cp -v {} work/super.noext \; 2>/dev/null || true
+
+          cd work
+          echo ""
+          echo ">>> Files in work/:"
+          ls -lh 2>/dev/null || echo "(empty)"
+
+          # Step 4: Decompress
+          for ext in zst lz4 xz br gz bz2; do
+            if [ -f "super.img.$ext" ]; then
+              echo ">>> Decompressing super.img.$ext..."
+              case "$ext" in
+                zst) zstd -d "super.img.$ext" -o super.img 2>&1 && rm -f "super.img.$ext" ;;
+                lz4) lz4 -d "super.img.$ext" super.img 2>&1 && rm -f "super.img.$ext" ;;
+                xz)  unxz -f "super.img.$ext" 2>&1 ;;
+                br)  brotli -d "super.img.$ext" -o super.img 2>&1 && rm -f "super.img.$ext" ;;
+                gz)  gunzip -f "super.img.$ext" 2>&1 ;;
+                bz2) bunzip2 -f "super.img.$ext" 2>&1 ;;
+              esac
+              echo "  -> $(ls -lh super.img 2>/dev/null | awk '{print $5}')"
+            fi
+          done
+
+          for ext in zst lz4 xz br gz bz2; do
+            if [ -f "super.$ext" ]; then
+              echo ">>> Decompressing super.$ext -> super.img..."
+              case "$ext" in
+                zst) zstd -d "super.$ext" -o super.img 2>&1 && rm -f "super.$ext" ;;
+                lz4) lz4 -d "super.$ext" super.img 2>&1 && rm -f "super.$ext" ;;
+                xz)  unxz -c "super.$ext" > super.img 2>&1 && rm -f "super.$ext" ;;
+                br)  brotli -d "super.$ext" -o super.img 2>&1 && rm -f "super.$ext" ;;
+                gz)  gunzip -c "super.$ext" > super.img 2>&1 && rm -f "super.$ext" ;;
+                bz2) bunzip2 -c "super.$ext" > super.img 2>&1 && rm -f "super.$ext" ;;
+              esac
+              echo "  -> $(ls -lh super.img 2>/dev/null | awk '{print $5}')"
+            fi
+          done
+
+          if [ -f super.noext ] && [ ! -f super.img ]; then
+            echo ">>> Renaming super -> super.img"
+            mv super.noext super.img
+          fi
+
+          # Step 5: Merge splitted parts
           shopt -s nullglob
           parts=( super.img.[0-9]* )
           if [ ${#parts[@]} -gt 0 ]; then
-            echo "Merging ${#parts[@]} splitted super.img parts..."
+            echo ">>> Merging ${#parts[@]} splitted parts..."
             cat "${parts[@]}" > super.img.merged && mv super.img.merged super.img
             rm -f super.img.[0-9]*
           fi
           shopt -u nullglob
 
+          echo ""
+          echo ">>> Final state in work/:"
+          ls -lh
+
+          # Step 6: Verify
           if [ ! -f super.img ]; then
-            echo "❌ super.img not found" && exit 1
+            echo ""
+            echo "===================================================="
+            echo "❌  FAILED: No super image found!"
+            echo "===================================================="
+            exit 1
           fi
 
-          echo "✅ super.img ready ($(ls -lh super.img | awk '{print $5}'))"
+          echo ""
+          echo ">>> File type:"
+          file super.img
+          echo ">>> Size: $(ls -lh super.img | awk '{print $5}')"
 
       # =========================
-      # 6. CONVERT SPARSE IF NEEDED
+      # 6. CONVERT SPARSE → RAW
       # =========================
       - name: Normalize image (sparse -> raw)
         run: |
           cd work
 
+          echo ">>> Checking super.img format:"
           file super.img
 
-          simg2img super.img super.raw.img || \
-          cp super.img super.raw.img
+          if command -v simg2img >/dev/null 2>&1; then
+            echo ">>> Attempting sparse->raw conversion..."
+            simg2img super.img super.raw.img && {
+              echo "✅ Sparse image converted to raw"
+            } || {
+              echo "⚠️  Not a sparse image. Copying as-is."
+              cp super.img super.raw.img
+            }
+          else
+            cp super.img super.raw.img
+          fi
+
+          echo ">>> Final raw image:"
+          ls -lh super.raw.img
 
       # =========================
-      # 7. UNPACK SUPER (CRITICAL STEP)
+      # 7. UNPACK SUPER IMAGE
       # =========================
       - name: Unpack super.img
         run: |
           mkdir super_out
 
-          ./lpunpack work/super.raw.img super_out || {
-            echo "lpunpack failed, retrying..."
-            sleep 2
-            ./lpunpack work/super.raw.img super_out || exit 1
-          }
+          echo ">>> Running lpunpack..."
+          ./lpunpack work/super.raw.img super_out 2>&1
+
+          RC=$?
+          echo ">>> Exit code: $RC"
+
+          if [ $RC -ne 0 ]; then
+            echo ""
+            echo "===================================================="
+            echo "❌  lpunpack FAILED (exit code $RC)"
+            echo "    Image header:"
+            xxd work/super.raw.img | head -4 2>/dev/null || true
+            echo "===================================================="
+            exit $RC
+          fi
+
+          echo ""
+          echo ">>> Partitions extracted:"
+          ls -lh super_out/
+          echo "Total: $(ls super_out/ | wc -l)"
 
       # =========================
       # 8. EXTRACT PARTITIONS (PARALLEL + FALLBACK)

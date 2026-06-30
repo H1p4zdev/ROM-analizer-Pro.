@@ -42,7 +42,13 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y unzip zip p7zip-full wget curl zstd erofs-utils android-sdk-libsparse-utils
+          sudo apt install -y \
+            unzip zip p7zip-full \
+            wget curl \
+            zstd xz-utils lz4 brotli \
+            erofs-utils \
+            android-sdk-libsparse-utils \
+            xxd file
 
       # =========================
       # 2. LPUNPACK
@@ -61,65 +67,195 @@ jobs:
           wget -O rom.zip "${{ github.event.inputs.rom_url }}"
 
       # =========================
-      # 4. EXTRACT ROM
+      # 4. EXTRACT ROM + VERIFY
       # =========================
       - name: Extract ROM
         run: |
           mkdir rom
           unzip -q rom.zip -d rom || 7z x rom.zip -orom -y
 
+          echo "========== ROM STRUCTURE (top 3 levels) =========="
+          find rom -maxdepth 3 -type f -o -type d | head -100
+          echo "=================================================="
+          echo "Total files extracted: $(find rom -type f | wc -l)"
+
       # =========================
-      # 5. FIND + MERGE SUPER
+      # 5. DISCOVER + PREPARE SUPER IMAGE
       # =========================
-      - name: Prepare super.img
+      - name: Prepare super image
         run: |
+          set -x  # echo all commands for debugging
+
           mkdir work
 
-          find rom -iname "super.img*" -exec cp {} work/ \; || true
-          cd work
+          # === STEP 1: Find all super-related files ===
+          echo ">>> Searching for super image files..."
+          find rom -type f \( \
+            -iname "super*" \
+          \) 2>/dev/null | sort > /tmp/super_files.txt
+          cat /tmp/super_files.txt
+          echo "---"
 
-          # Decompress .zst if present
-          if [ -f super.img.zst ]; then
-            echo "Decompressing super.img.zst..."
-            zstd -d super.img.zst -o super.img && rm -f super.img.zst
+          # === STEP 2: Also look for payload.bin ===
+          if grep -qi "payload.bin" /tmp/super_files.txt || find rom -iname "payload.bin" -type f | head -1 | grep -q .; then
+            echo "⚠️  Found payload.bin — this ROM uses incremental OTA, not super.img!"
+            echo "    payload.bin requires a different extraction method."
           fi
 
-          # Handle splitted sparse images (super.img.1, super.img.2, ...)
-          # Use shopt to get a sorted list of splitted parts (excluding super.img itself)
+          # === STEP 3: Copy everything matching super.img* or super*image* to work/ ===
+          find rom -type f \( \
+            -iname "super.img*" -o \
+            -iname "super*image*" -o \
+            -iname "super.raw*" \
+          \) -exec cp -v {} work/ \; 2>/dev/null || true
+
+          # Also check for bare "super" (no extension)
+          find rom -type f -name "super" -exec cp -v {} work/super.noext \; 2>/dev/null || true
+
+          cd work
+          echo ""
+          echo ">>> Files in work/ after copy:"
+          ls -lh 2>/dev/null || echo "(empty)"
+
+          # === STEP 4: Decompress common formats ===
+          # Decompress super.img.* (any compression format)
+          for ext in zst lz4 xz br gz bz2; do
+            if [ -f "super.img.$ext" ]; then
+              echo ">>> Decompressing super.img.$ext..."
+              case "$ext" in
+                zst) zstd -d "super.img.$ext" -o super.img 2>&1 && rm -f "super.img.$ext" ;;
+                lz4) lz4 -d "super.img.$ext" super.img 2>&1 && rm -f "super.img.$ext" ;;
+                xz)  unxz -f "super.img.$ext" 2>&1 ;;  # creates super.img in-place
+                br)  brotli -d "super.img.$ext" -o super.img 2>&1 && rm -f "super.img.$ext" ;;
+                gz)  gunzip -f "super.img.$ext" 2>&1 ;;  # creates super.img in-place
+                bz2) bunzip2 -f "super.img.$ext" 2>&1 ;;  # creates super.img in-place
+              esac
+              echo "  -> Result: $(ls -lh super.img 2>/dev/null | awk '{print $5}')"
+            fi
+          done
+
+          # Also handle bare "super" (no .img) with compression
+          for ext in zst lz4 xz br gz bz2; do
+            if [ -f "super.$ext" ]; then
+              echo ">>> Decompressing super.$ext -> super.img..."
+              case "$ext" in
+                zst) zstd -d "super.$ext" -o super.img 2>&1 && rm -f "super.$ext" ;;
+                lz4) lz4 -d "super.$ext" super.img 2>&1 && rm -f "super.$ext" ;;
+                xz)  unxz -c "super.$ext" > super.img 2>&1 && rm -f "super.$ext" ;;
+                br)  brotli -d "super.$ext" -o super.img 2>&1 && rm -f "super.$ext" ;;
+                gz)  gunzip -c "super.$ext" > super.img 2>&1 && rm -f "super.$ext" ;;
+                bz2) bunzip2 -c "super.$ext" > super.img 2>&1 && rm -f "super.$ext" ;;
+              esac
+              echo "  -> Result: $(ls -lh super.img 2>/dev/null | awk '{print $5}')"
+            fi
+          done
+
+          # Handle super.noext (bare "super" without extension)
+          if [ -f super.noext ] && [ ! -f super.img ]; then
+            echo ">>> Renaming super (no extension) -> super.img"
+            mv super.noext super.img
+          fi
+
+          # === STEP 5: Merge splitted parts ===
           shopt -s nullglob
           parts=( super.img.[0-9]* )
           if [ ${#parts[@]} -gt 0 ]; then
-            echo "Merging ${#parts[@]} splitted super.img parts..."
+            echo ""
+            echo ">>> Merging ${#parts[@]} splitted parts..."
             cat "${parts[@]}" > super.img.merged && mv super.img.merged super.img
             rm -f super.img.[0-9]*
           fi
           shopt -u nullglob
 
+          echo ""
+          echo ">>> Final state in work/:"
+          ls -lh
+
+          # === STEP 6: Verify & report ===
           if [ ! -f super.img ]; then
-            echo "❌ super.img not found after preparation" && exit 1
+            echo ""
+            echo "===================================================="
+            echo "❌  FAILED: No super image found!"
+            echo "    Searched patterns: super.img*, super*image*, super.raw*, super (no ext)"
+            echo "    All extracted files listed above in ROM STRUCTURE."
+            echo "    This ROM may use a different partition scheme."
+            echo "===================================================="
+            exit 1
           fi
-          echo "✅ super.img ready ($(ls -lh super.img | awk '{print $5}'))"
+
+          SIZE=$(ls -lh super.img | awk '{print $5}')
+          echo ""
+          echo ">>> File type identification:"
+          file super.img
+
+          echo ""
+          echo "============================================"
+          echo "✅  super.img ready — size: $SIZE"
+          echo "============================================"
 
       # =========================
-      # 6. SAFE SPARSE HANDLING
+      # 6. CONVERT SPARSE → RAW (IF NEEDED)
       # =========================
-      - name: Normalize image
+      - name: Normalize image (sparse→raw)
         run: |
           cd work
 
+          echo ">>> Checking super.img format:"
+          file super.img
+
+          # Try simg2img; if it fails, it's likely already raw — just copy
           if command -v simg2img >/dev/null 2>&1; then
-            simg2img super.img super.raw.img || cp super.img super.raw.img
+            echo ">>> Attempting sparse->raw conversion..."
+            simg2img super.img super.raw.img && {
+              echo "✅ Sparse image converted to raw"
+            } || {
+              echo "⚠️  Not a sparse image (or conversion failed). Copying as-is."
+              cp super.img super.raw.img
+            }
           else
+            echo "⚠️  simg2img not available. Copying as-is."
             cp super.img super.raw.img
           fi
 
+          echo ">>> Final raw image:"
+          ls -lh super.raw.img
+
       # =========================
-      # 7. UNPACK SUPER
+      # 7. UNPACK SUPER IMAGE
       # =========================
       - name: Unpack partitions
         run: |
           mkdir super_out
-          ./lpunpack work/super.raw.img super_out
+
+          echo ">>> Running lpunpack..."
+          echo "    Input: work/super.raw.img"
+          echo "    Output: super_out/"
+          echo ""
+
+          ./lpunpack work/super.raw.img super_out 2>&1
+
+          RC=$?
+          echo ""
+          echo ">>> lpunpack exit code: $RC"
+
+          if [ $RC -ne 0 ]; then
+            echo ""
+            echo "===================================================="
+            echo "❌  lpunpack FAILED (exit code $RC)"
+            echo "    Possible causes:"
+            echo "      - Image is not a valid logical partition (super) format"
+            echo "      - Image is corrupted or truncated during download"
+            echo "      - Different image format (e.g. EROFS, EXT4 directly)"
+            echo "    Checking image header:"
+            xxd work/super.raw.img | head -4 2>/dev/null || true
+            echo "===================================================="
+            exit $RC
+          fi
+
+          echo ""
+          echo ">>> lpunpack output:"
+          ls -lh super_out/
+          echo "Total partitions extracted: $(ls super_out/ | wc -l)"
 
       # =========================
       # 8. EXTRACT APK ONLY
