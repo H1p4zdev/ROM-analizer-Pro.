@@ -170,7 +170,7 @@ jobs:
           echo ">>> Size: $(ls -lh super.img | awk '{print $5}')"
 
       # =========================
-      # 6. CONVERT SPARSE → RAW
+      # 6. SPARSE CHECK → USE RAW DIRECTLY
       # =========================
       - name: Normalize image (sparse→raw)
         run: |
@@ -179,20 +179,15 @@ jobs:
           echo ">>> Checking super.img format:"
           file super.img
 
-          if command -v simg2img >/dev/null 2>&1; then
-            echo ">>> Attempting sparse->raw conversion..."
-            simg2img super.img super.raw.img && {
-              echo "✅ Sparse image converted to raw"
-            } || {
-              echo "⚠️  Not a sparse image. Copying as-is."
-              cp super.img super.raw.img
-            }
+          # Test if sparse: simg2img to /dev/null succeeds only for sparse images
+          if simg2img super.img /dev/null 2>/dev/null; then
+            echo ">>> ✅ Sparse image detected. Converting to raw..."
+            simg2img super.img super.raw.img
+            echo "    Converted: $(ls -lh super.raw.img | awk '{print $5}')"
           else
-            cp super.img super.raw.img
+            echo ">>> ✅ Image is already raw. No conversion needed."
+            echo "    Using super.img directly (skipping copy)."
           fi
-
-          echo ">>> Final raw image:"
-          ls -lh super.raw.img
 
       # =========================
       # 7. UNPACK SUPER IMAGE
@@ -201,8 +196,35 @@ jobs:
         run: |
           mkdir super_out
 
+          # Use super.raw.img if sparse conversion happened, otherwise super.img
+          if [ -f work/super.raw.img ]; then
+            IMG="work/super.raw.img"
+          else
+            IMG="work/super.img"
+          fi
+
+          echo ">>> Input image: $IMG ($(ls -lh "$IMG" | awk '{print $5}'))"
           echo ">>> Running lpunpack..."
-          ./lpunpack work/super.raw.img super_out 2>&1
+          ./lpunpack "$IMG" super_out 2>&1
+
+          RC=$?
+          echo ""
+          echo ">>> lpunpack exit code: $RC"
+
+          if [ $RC -ne 0 ]; then
+            echo ""
+            echo "===================================================="
+            echo "❌  lpunpack FAILED (exit code $RC)"
+            echo "    Image header:"
+            xxd "$IMG" | head -4 2>/dev/null || true
+            echo "===================================================="
+            exit $RC
+          fi
+
+          echo ""
+          echo ">>> Partitions extracted:"
+          ls -lh super_out/
+          echo "Total: $(ls super_out/ | wc -l)"
 
           RC=$?
           echo ""
